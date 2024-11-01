@@ -8,7 +8,7 @@ export default function LandingPage() {
     <div className='landingPageContainer'>
        <nav>
 <div className='navHeader'>
-    <h2>EngageX Video Call</h2>
+    <h2>MeetMatrix Video Call</h2>
 </div>
 <div className='navlist'>
     <p onClick={() => {
