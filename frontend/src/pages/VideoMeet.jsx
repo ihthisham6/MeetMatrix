@@ -26,12 +26,21 @@ var connections = {};
 // setRemoteDescription completes, then flushes them after.
 var iceCandidateQueue = {};
 
-// TURN servers — critical for cross-network connections (phone on cellular,
-// PC on WiFi etc). STUN alone fails when peers are behind strict NATs.
+// Signal queue — buffers SDP signals that arrive before the peer connection
+// object exists. This happens when the remote peer sends an offer before
+// our user-joined handler has created connections[fromId].
+var signalQueue = {};
+
+// TURN servers — multiple providers for reliability fallback.
+// openrelay is free but rate-limited; Google STUN + multiple TURN endpoints
+// maximises the chance of a successful ICE connection across different networks.
 const peerConfigConnections = {
     iceServers: [
         { urls: "stun:stun.l.google.com:19302" },
-        { urls: "stun:openrelay.metered.ca:80" },
+        { urls: "stun:stun1.l.google.com:19302" },
+        { urls: "stun:stun2.l.google.com:19302" },
+        { urls: "stun:stun3.l.google.com:19302" },
+        { urls: "stun:stun4.l.google.com:19302" },
         {
             urls: "turn:openrelay.metered.ca:80",
             username: "openrelayproject",
@@ -46,9 +55,40 @@ const peerConfigConnections = {
             urls: "turn:openrelay.metered.ca:443?transport=tcp",
             username: "openrelayproject",
             credential: "openrelayproject"
+        },
+        {
+            urls: "turn:relay1.expressturn.com:3478",
+            username: "efVQYKCKIFJEFMZBNF",
+            credential: "iSXQMCMrWlADNQGe"
         }
-    ]
+    ],
+    iceCandidatePoolSize: 10
 };
+
+// VideoTile — dedicated component for each remote participant's video.
+// Using useEffect to set srcObject is more reliable than an inline ref callback,
+// especially on mobile Safari where the ref fires before the stream is fully active.
+function VideoTile({ socketId, stream }) {
+    const ref = useRef(null);
+
+    useEffect(() => {
+        if (ref.current && stream) {
+            ref.current.srcObject = stream;
+        }
+    }, [stream]);
+
+    return (
+        <div>
+            <video
+                ref={ref}
+                data-socket={socketId}
+                autoPlay
+                playsInline
+                style={{ width: '100%', borderRadius: '10px', background: '#111' }}
+            />
+        </div>
+    );
+}
 
 export default function VideoMeetComponent() {
 
@@ -158,60 +198,58 @@ export default function VideoMeetComponent() {
     };
 
     // ─── Handle incoming WebRTC signals from remote peers ─────────────────────
-    const gotMessageFromServer = (fromId, message) => {
-        const signal = JSON.parse(message);
-        if (fromId === socketIdRef.current) return;
-
+    const processSignal = (fromId, signal) => {
         if (signal.sdp) {
             connections[fromId]
                 .setRemoteDescription(new RTCSessionDescription(signal.sdp))
                 .then(() => {
-                    // Flush any ICE candidates that arrived before SDP
+                    // Flush queued ICE candidates
                     if (iceCandidateQueue[fromId] && iceCandidateQueue[fromId].length > 0) {
                         iceCandidateQueue[fromId].forEach(candidate => {
                             connections[fromId]
                                 .addIceCandidate(new RTCIceCandidate(candidate))
-                                .catch(e => console.log("[ICE Queue flush error]:", e));
+                                .catch(e => console.log("[ICE Queue flush]:", e));
                         });
                         iceCandidateQueue[fromId] = [];
                     }
-
                     if (signal.sdp.type === "offer") {
-                        connections[fromId]
-                            .createAnswer()
+                        connections[fromId].createAnswer()
                             .then(description => {
-                                connections[fromId]
-                                    .setLocalDescription(description)
+                                connections[fromId].setLocalDescription(description)
                                     .then(() => {
-                                        socketRef.current.emit(
-                                            "signal",
-                                            fromId,
-                                            JSON.stringify({ sdp: connections[fromId].localDescription })
-                                        );
-                                    })
-                                    .catch(e => console.log(e));
-                            })
-                            .catch(e => console.log(e));
+                                        socketRef.current.emit("signal", fromId,
+                                            JSON.stringify({ sdp: connections[fromId].localDescription }));
+                                    }).catch(e => console.log(e));
+                            }).catch(e => console.log(e));
                     }
-                })
-                .catch(e => console.log(e));
+                }).catch(e => console.log(e));
         }
-
         if (signal.ice) {
-            // Queue candidates if remote description isn't set yet
-            if (
-                connections[fromId] &&
-                connections[fromId].remoteDescription &&
-                connections[fromId].remoteDescription.type
-            ) {
-                connections[fromId]
-                    .addIceCandidate(new RTCIceCandidate(signal.ice))
+            if (connections[fromId] && connections[fromId].remoteDescription && connections[fromId].remoteDescription.type) {
+                connections[fromId].addIceCandidate(new RTCIceCandidate(signal.ice))
                     .catch(e => console.log("[ICE error]:", e));
             } else {
                 if (!iceCandidateQueue[fromId]) iceCandidateQueue[fromId] = [];
                 iceCandidateQueue[fromId].push(signal.ice);
             }
         }
+    };
+
+    const gotMessageFromServer = (fromId, message) => {
+        const signal = JSON.parse(message);
+        if (fromId === socketIdRef.current) return;
+
+        // If peer connection does not exist yet, queue the signal.
+        // This happens when the remote peer sends an offer before our
+        // user-joined handler has run and created connections[fromId].
+        if (!connections[fromId]) {
+            console.log("[Signal] Queuing signal from", fromId, "— peer connection not ready yet");
+            if (!signalQueue[fromId]) signalQueue[fromId] = [];
+            signalQueue[fromId].push(signal);
+            return;
+        }
+
+        processSignal(fromId, signal);
     };
 
     const addMessage = (data, sender, socketIdSender) => {
@@ -247,9 +285,17 @@ export default function VideoMeetComponent() {
             socketRef.current.on("user-joined", (id, clients) => {
                 // Create peer connections for everyone currently in the room
                 clients.forEach(socketListId => {
+                    if (socketListId === socketIdRef.current) return; // skip self — was causing double video tile
                     if (connections[socketListId]) return; // already exists
                     connections[socketListId] = createPeerConnection(socketListId);
                     addLocalTracks(connections[socketListId]);
+
+                    // Flush any signals that arrived before this connection was created
+                    if (signalQueue[socketListId] && signalQueue[socketListId].length > 0) {
+                        console.log("[Signal] Flushing", signalQueue[socketListId].length, "queued signals for", socketListId);
+                        signalQueue[socketListId].forEach(signal => processSignal(socketListId, signal));
+                        signalQueue[socketListId] = [];
+                    }
                 });
 
                 // Only the NEW joiner creates offers — prevents duplicate offer collisions
@@ -453,19 +499,8 @@ export default function VideoMeetComponent() {
 
                     {/* Remote Participants */}
                     <div className={styles.conferenceView}>
-                        {videos.map((video) => (
-                            <div key={video.socketId}>
-                                <video
-                                    data-socket={video.socketId}
-                                    ref={ref => {
-                                        if (ref && video.stream) {
-                                            ref.srcObject = video.stream;
-                                        }
-                                    }}
-                                    autoPlay
-                                    playsInline>
-                                </video>
-                            </div>
+                        {videos.map((v) => (
+                            <VideoTile key={v.socketId} socketId={v.socketId} stream={v.stream} />
                         ))}
                     </div>
 
