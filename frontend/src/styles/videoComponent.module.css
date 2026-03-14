@@ -2,6 +2,7 @@
     position:relative;
     height:100vh;
     background:rgb(1,4,48);
+    overflow: hidden;
 }
 
  .meetUserVideo{
@@ -10,7 +11,8 @@
     height:20vh;
     width:auto;
     left:0;
-    border-radius:20px ;
+    border-radius:20px;
+    z-index: 10;
 }
 
 
@@ -19,6 +21,7 @@ position:absolute;
 width:100vw;
 bottom:0;
 text-align:center;
+z-index: 10;
 }
 
 .buttonContainers svg {
@@ -26,18 +29,34 @@ text-align:center;
 }
 
 
+/* 
+  Responsive grid — automatically fits all participants on screen.
+  grid-template-columns: repeat(auto-fit, ...) means:
+    - 1 person  → 1 large tile
+    - 2 people  → 2 side by side
+    - 4 people  → 2x2 grid
+    - 9 people  → 3x3 grid
+  No horizontal overflow, all tiles always visible on screen.
+*/
 .conferenceView {
-    display: flex;
-padding:10px;
-gap: 10px;
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 10px;
+    padding: 10px;
+    /* Leave room at bottom for controls + self-view */
+    max-height: 85vh;
+    overflow-y: auto;
+    align-items: center;
 }
 
 
-.conferenceView  video {
-    width: 40vw;
-    height:20vh;
-    min-width:30vw;
-    border-radius:10px;
+.conferenceView video {
+    width: 100%;
+    height: 100%;
+    max-height: 35vh;
+    border-radius: 10px;
+    object-fit: cover;
+    background: #111;
 }
 
 
@@ -49,6 +68,7 @@ gap: 10px;
     border-radius:10px;
     width:30vw;
     padding-inline:20px;
+    z-index: 10;
 }
 
 
@@ -62,5 +82,3 @@ gap: 10px;
     position:absolute;
     bottom:0;
 }
-
-

@@ -21,12 +21,29 @@ import server from '../environment';
 const server_url = server;
 
 var connections = {};
+// TURN servers added for cross-network support (e.g., iPhone on cellular <-> PC on WiFi).
+// STUN alone fails when both peers are behind strict/symmetric NATs (common on mobile networks).
+// TURN relays media through a server as a fallback when direct P2P cannot be established.
 const peerConfigConnections = {
-    "iceServers":[
+    iceServers: [
+        { urls: "stun:stun.l.google.com:19302" },
+        { urls: "stun:openrelay.metered.ca:80" },
         {
-            "urls":"stun:stun.l.google.com:19302"
+            urls: "turn:openrelay.metered.ca:80",
+            username: "openrelayproject",
+            credential: "openrelayproject"
+        },
+        {
+            urls: "turn:openrelay.metered.ca:443",
+            username: "openrelayproject",
+            credential: "openrelayproject"
+        },
+        {
+            urls: "turn:openrelay.metered.ca:443?transport=tcp",
+            username: "openrelayproject",
+            credential: "openrelayproject"
         }
-    ]
+    ],
 }
 
 export default function VideoMeetComponent() {
@@ -67,6 +84,9 @@ let [username,setUsername] = useState("");
 const videoRef= useRef([]);
 
 let [videos,setVideos] = useState([]);
+
+// Tracks whether the room has hit MAX_ROOM_SIZE on the server
+let [roomFull, setRoomFull] = useState(false);
 
 
 
@@ -224,27 +244,67 @@ useEffect(() => {
 
 
 
-let gotMessageFromServer = (fromId,message) => {
+// ICE candidate queue — fixes race condition where ICE candidates arrive
+// before setRemoteDescription is called. Without this, addIceCandidate throws
+// "remote description was null" and the peer connection never completes.
+// We buffer candidates per peer and flush them once remote description is set.
+var iceCandidateQueue = {};
 
-var signal = JSON.parse(message);
-if(fromId !== socketIdRef.current) {
-  if(signal.sdp){
-    connections[fromId].setRemoteDescription(new RTCSessionDescription(signal.sdp)).then(() => {
-      if(signal.sdp.type === "offer"){
-        connections[fromId].createAnswer().then((description) => {
-          connections[fromId].setLocalDescription(description).then(() => {
-            socketRef.current.emit("signal",fromId,JSON.stringify({"sdp":connections[fromId].localDescription}))
-          }).catch(e => console.log(e))
-        }).catch(e => console.log(e))
-      }
-    }).catch(e => console.log(e))
+let gotMessageFromServer = (fromId, message) => {
+  var signal = JSON.parse(message);
+
+  if (fromId === socketIdRef.current) return;
+
+  if (signal.sdp) {
+    connections[fromId]
+      .setRemoteDescription(new RTCSessionDescription(signal.sdp))
+      .then(() => {
+        // Flush any ICE candidates that arrived before remote description
+        if (iceCandidateQueue[fromId]) {
+          iceCandidateQueue[fromId].forEach(candidate => {
+            connections[fromId]
+              .addIceCandidate(new RTCIceCandidate(candidate))
+              .catch(e => console.log("Queued ICE error:", e));
+          });
+          iceCandidateQueue[fromId] = [];
+        }
+
+        if (signal.sdp.type === "offer") {
+          connections[fromId]
+            .createAnswer()
+            .then(description => {
+              connections[fromId]
+                .setLocalDescription(description)
+                .then(() => {
+                  socketRef.current.emit(
+                    "signal",
+                    fromId,
+                    JSON.stringify({ sdp: connections[fromId].localDescription })
+                  );
+                })
+                .catch(e => console.log(e));
+            })
+            .catch(e => console.log(e));
+        }
+      })
+      .catch(e => console.log(e));
   }
-  if(signal.ice){
-    connections[fromId].addIceCandidate(new RTCIceCandidate(signal.ice)).catch(e => console.log(e))
+
+  if (signal.ice) {
+    // If remote description is not set yet, queue the candidate
+    if (
+      connections[fromId] &&
+      connections[fromId].remoteDescription &&
+      connections[fromId].remoteDescription.type
+    ) {
+      connections[fromId]
+        .addIceCandidate(new RTCIceCandidate(signal.ice))
+        .catch(e => console.log("ICE error:", e));
+    } else {
+      if (!iceCandidateQueue[fromId]) iceCandidateQueue[fromId] = [];
+      iceCandidateQueue[fromId].push(signal.ice);
+    }
   }
-}
-
-
 }
 
 
@@ -267,18 +327,31 @@ if(socketIdSender !== socketIdRef.current){
 
 
 let connectToSocketServer = () => {
-  socketRef.current = io.connect(server_url, {secure: false})
+  // Removed {secure: false} — it was causing mixed-content blocks on iOS Safari.
+  // The URL scheme (https) automatically negotiates WSS (secure WebSocket).
+  socketRef.current = io.connect(server_url)
 
   socketRef.current.on('signal',gotMessageFromServer);
 
   socketRef.current.on("connect", () => {
-    socketRef.current.emit("join-call",window.location.href);
     socketIdRef.current = socketRef.current.id
-      socketRef.current.on("chat-message",addMessage)
 
-    socketRef.current.on("user-left",(id) => {
-setVideos((videos) => videos.filter((video) => video.socketId !== id))
+    // Register room-full BEFORE emitting join-call.
+    // Server can respond so fast that the event arrives before the listener
+    // exists — silently dropped. Registering first guarantees we catch it.
+    socketRef.current.on("room-full", () => {
+      setRoomFull(true);
+      socketRef.current.disconnect();
     })
+
+    socketRef.current.on("chat-message", addMessage)
+
+    socketRef.current.on("user-left", (id) => {
+      setVideos((videos) => videos.filter((video) => video.socketId !== id))
+    })
+
+    // join-call emitted last — all listeners set up first
+    socketRef.current.emit("join-call", window.location.href);
     socketRef.current.on("user-joined",(id,clients) => {
       clients.forEach((socketListId) => {
         connections[socketListId] = new RTCPeerConnection(peerConfigConnections)
@@ -312,7 +385,7 @@ let newVideo = {
   socketId:socketListId,
   stream: event.stream,
   autoPlay:true,
-  playsinlline:true
+  playsInline:true  // was: playsinlline (typo with 3 l's — key was never applied to DOM)
 }
 
 setVideos(videos => {
@@ -477,106 +550,112 @@ let handleEndCall = () => {
   return (
     <div>
 
-     {askForUsername === true ?
-     
-    <div> 
-<h2>Enter into Lobby</h2>
-<TextField id="outlined-basic" label="Username" value={username} onChange={e => setUsername(e.target.value)}variant="outlined" />
-<Button variant="contained" onClick={connect}>Connect</Button>
+      {/* ── Room Full Screen ── */}
+      {roomFull && (
+        <div style={{display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",height:"100vh",background:"rgb(1,4,48)",color:"white"}}>
+          <h2 style={{fontSize:"2rem"}}>🚫 Room is Full</h2>
+          <p style={{color:"#aaa",marginTop:"8px"}}>This meeting has reached the maximum of 10 participants.</p>
+          <Button variant="contained" style={{marginTop:"24px"}} onClick={() => window.location.href="/"}>Go Home</Button>
+        </div>
+      )}
 
+      {/* ── Lobby / Username Screen ── */}
+      {!roomFull && askForUsername && (
+        <div>
+          <h2>Enter into Lobby</h2>
+          <TextField
+            id="outlined-basic"
+            label="Username"
+            value={username}
+            onChange={e => setUsername(e.target.value)}
+            variant="outlined"
+          />
+          <Button variant="contained" onClick={connect}>Connect</Button>
+          <div className={styles.meetVideoContainer}>
+            <video ref={localVideoRef} autoPlay muted playsInline></video>
+          </div>
+        </div>
+      )}
 
-<div className={styles.meetVideoContainer}>
+      {/* ── Meeting Room Screen ── */}
+      {!roomFull && !askForUsername && (
+        <div className={styles.meetVideoContainer}>
 
+          {/* Chat Panel */}
+          {showModal && (
+            <div className={styles.chatRoom}>
+              <div className={styles.chatContainer}>
+                <h1>Chat</h1>
+                <div className={styles.chattingDisplay}>
+                  {messages.length !== 0 ? messages.map((item, index) => (
+                    <div style={{marginBottom:"20px"}} key={index}>
+                      <p style={{fontWeight:"bold"}}>{item.sender}</p>
+                      <p>{item.data}</p>
+                    </div>
+                  )) : <p>No Messages Yet!</p>}
+                </div>
+                <div className={styles.chattingArea}>
+                  <TextField
+                    value={message}
+                    onChange={(e) => setMessage(e.target.value)}
+                    id="outlined-basic"
+                    label="Enter your chat"
+                    variant="outlined"
+                  />
+                  <Button variant='contained' onClick={sendMessage}>Send</Button>
+                </div>
+              </div>
+            </div>
+          )}
 
+          {/* Controls */}
+          <div className={styles.buttonContainers}>
+            <IconButton onClick={handleVideo} style={{color:"white"}}>
+              {video === true ? <VideocamIcon/> : <VideocamOffIcon/>}
+            </IconButton>
+            <IconButton onClick={handleEndCall} style={{color:"red"}}>
+              <CallEndIcon/>
+            </IconButton>
+            <IconButton onClick={handleAudio} style={{color:"white"}}>
+              {audio === true ? <MicIcon/> : <MicOffIcon/>}
+            </IconButton>
+            {screenAvailable === true && (
+              <IconButton onClick={handleScreen} style={{color:"white"}}>
+                {screen === true ? <ScreenShareIcon/> : <StopScreenShareIcon/>}
+              </IconButton>
+            )}
+            <Badge badgeContent={newMessages} max={999} color='secondary'>
+              <IconButton onClick={() => setModal(!showModal)} style={{color:"white"}}>
+                <ChatIcon/>
+              </IconButton>
+            </Badge>
+          </div>
 
-  <video ref={localVideoRef} autoPlay muted></video>
-  </div>
-    </div> :
-   <div className={styles.meetVideoContainer}>
+          {/* Self View */}
+          <video className={styles.meetUserVideo} ref={localVideoRef} autoPlay muted playsInline></video>
 
+          {/* Remote Participants */}
+          <div className={styles.conferenceView}>
+            {videos.map((video) => (
+              <div key={video.socketId}>
+                <video
+                  data-socket={video.socketId}
+                  ref={ref => {
+                    if (ref && video.stream) {
+                      ref.srcObject = video.stream;
+                    }
+                  }}
+                  autoPlay
+                  playsInline>
+                </video>
+              </div>
+            ))}
+          </div>
 
+        </div>
+      )}
 
-{showModal ? 
-<div className={styles.chatRoom}>
-<div className = {styles.chatContainer}>
-<h1>Chat</h1>
-
-
-<div className={styles.chattingDisplay}>
-
-
-{ messages.length !== 0 ? messages.map((item,index) => {
-  console.log(messages);
-  return(
-    <div style = {{marginBottom:"20px"}}key={index}>
-      <p style={{fontWeight:"bold"}}>{item.sender}</p>
-      <p>{item.data}</p>
-      </div>
-  )
-}):<p>No Messages Yet!</p>
-}
-
-</div>
-
-
-<div className={styles.chattingArea}>
-  
-<TextField value={message} onChange = {(e) => setMessage(e.target.value)}id="outlined-basic" label="Enter your chat" variant="outlined" />
-<Button variant='contained' onClick={sendMessage}>Send</Button>
-</div>
-</div>
-  </div>:<></>}
-
-
-
-<div className={styles.buttonContainers}>
-<IconButton onClick={handleVideo} style={{color:"white"}}>
-  {(video === true) ? <VideocamIcon/>:<VideocamOffIcon/>}
-</IconButton>
-
-<IconButton onClick={handleEndCall} style={{color:"red"}}>
-  <CallEndIcon/>
-</IconButton>
-
-<IconButton onClick={handleAudio} style={{color:"white"}}>
-{audio === true?  <MicIcon/> :<MicOffIcon/>}
-</IconButton>
-
-{screenAvailable === true ? 
-<IconButton onClick={handleScreen}style={{color:"white"}}>
-  {screen === true ? <ScreenShareIcon/> : <StopScreenShareIcon/>}
-  </IconButton>:<>:</>}
-  
-  <Badge badgeContent = {newMessages} max={999} color='secondary'>
-  <IconButton onClick={() => setModal(!showModal)} style={{color:"white"}}>
-  <ChatIcon/>
-</IconButton>
-</Badge>
-
-</div>
-  
-    <video className={styles.meetUserVideo} ref={localVideoRef} autoPlay muted></video>
-<div className={styles.conferenceView}>
-    {videos.map((video) =>(
-      <div key={video.socketId}>
-<video data-socket = {video.socketId}
-  ref={ref => {
-    if(ref && video.stream){
-      ref.srcObject = video.stream;
-    }
-  }}
-  autoPlay>
-</video>
-     
-      </div>
-    ))}
     </div>
-</div>
-    }
-      
-      
-      
-      </div>
   )
 }
 
