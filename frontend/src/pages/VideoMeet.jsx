@@ -134,7 +134,7 @@ export default function VideoMeetComponent() {
     let [roomFull, setRoomFull] = useState(false);
     let [participants, setParticipants] = useState({});
     let [usernameError, setUsernameError] = useState(""); // socketId -> username map
-    let [participants, setParticipants] = useState({});
+  
 
     // ─── Get camera/mic once on mount for the lobby preview ───────────────────
     useEffect(() => {
