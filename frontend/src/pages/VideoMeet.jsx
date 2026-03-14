@@ -134,7 +134,7 @@ export default function VideoMeetComponent() {
     let [roomFull, setRoomFull] = useState(false);
     let [participants, setParticipants] = useState({});
     let [usernameError, setUsernameError] = useState(""); // socketId -> username map
-    
+    let [participants, setParticipants] = useState({});
 
     // ─── Get camera/mic once on mount for the lobby preview ───────────────────
     useEffect(() => {
@@ -191,6 +191,15 @@ export default function VideoMeetComponent() {
         init();
     }, []);
 
+    // When askForUsername flips to false, React unmounts the lobby <video> and
+    // mounts the meeting room <video>. The new element has no srcObject — we must
+    // reattach window.localStream to it. This is why self-video showed as black.
+    useEffect(() => {
+        if (!askForUsername && localVideoRef.current && window.localStream) {
+            localVideoRef.current.srcObject = window.localStream;
+        }
+    }, [askForUsername]);
+
     // ─── Add local tracks to a peer connection ─────────────────────────────────
     // Uses addTrack (modern API) instead of deprecated addStream.
     const addLocalTracks = (pc) => {
@@ -217,16 +226,19 @@ export default function VideoMeetComponent() {
             console.log(`[ICE] ${socketListId}: ${pc.iceConnectionState}`);
         };
 
-        // ontrack fires when the remote peer's tracks arrive.
-        // REPLACES the deprecated onaddstream — this is why video wasn't
-        // rendering on mobile: onaddstream is not reliably fired on iOS Safari
-        // or modern Chrome. ontrack is the correct modern API.
+        // ontrack fires once per TRACK — so for a peer with video+audio it fires TWICE.
+        // Both events arrive nearly simultaneously, causing a race condition where both
+        // see videoRef.current as empty and both add a new tile (double tile bug).
+        // Fix: use a plain object (addedStreams) as a synchronous lock — it updates
+        // instantly unlike React state, so the second ontrack sees the first one ran.
         pc.ontrack = (event) => {
             const stream = event.streams[0];
             if (!stream) return;
 
-            const videoExists = videoRef.current.find(v => v.socketId === socketListId);
-            if (videoExists) {
+            // Synchronous check using videoRef directly — avoids the React state race
+            const alreadyAdded = videoRef.current.find(v => v.socketId === socketListId);
+            if (alreadyAdded) {
+                // Stream already in list — just update it in case it changed
                 setVideos(prev => {
                     const updated = prev.map(v =>
                         v.socketId === socketListId ? { ...v, stream } : v
@@ -234,14 +246,17 @@ export default function VideoMeetComponent() {
                     videoRef.current = updated;
                     return updated;
                 });
-            } else {
-                const newVideo = { socketId: socketListId, stream };
-                setVideos(prev => {
-                    const updated = [...prev, newVideo];
-                    videoRef.current = updated;
-                    return updated;
-                });
+                return;
             }
+
+            // Add synchronously to the ref FIRST before any state update
+            // so subsequent ontrack fires for this peer see it immediately
+            const newVideo = { socketId: socketListId, stream };
+            videoRef.current = [...videoRef.current, newVideo];
+
+            setVideos(() => {
+                return videoRef.current;
+            });
         };
 
         return pc;
