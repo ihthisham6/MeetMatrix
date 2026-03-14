@@ -15,6 +15,7 @@ import StopScreenShareIcon from '@mui/icons-material/StopScreenShare';
 import MicOffIcon from '@mui/icons-material/MicOff';
 import { useNavigate } from 'react-router-dom';
 import ChatIcon from '@mui/icons-material/Chat'
+import ContentCopyIcon from '@mui/icons-material/ContentCopy'
 import server from '../environment';
 
 const server_url = server;
@@ -31,61 +32,81 @@ var iceCandidateQueue = {};
 // our user-joined handler has created connections[fromId].
 var signalQueue = {};
 
-// TURN servers — multiple providers for reliability fallback.
-// openrelay is free but rate-limited; Google STUN + multiple TURN endpoints
-// maximises the chance of a successful ICE connection across different networks.
-const peerConfigConnections = {
+// ICE config — populated at runtime by fetching fresh TURN credentials
+// from Metered.ca. Fresh credentials avoid rate-limiting issues that cause
+// ICE to go straight to "disconnected" on mobile networks.
+// Fallback to static STUN-only if the fetch fails.
+var peerConfigConnections = {
     iceServers: [
         { urls: "stun:stun.l.google.com:19302" },
         { urls: "stun:stun1.l.google.com:19302" },
-        { urls: "stun:stun2.l.google.com:19302" },
-        { urls: "stun:stun3.l.google.com:19302" },
-        { urls: "stun:stun4.l.google.com:19302" },
-        {
-            urls: "turn:openrelay.metered.ca:80",
-            username: "openrelayproject",
-            credential: "openrelayproject"
-        },
-        {
-            urls: "turn:openrelay.metered.ca:443",
-            username: "openrelayproject",
-            credential: "openrelayproject"
-        },
-        {
-            urls: "turn:openrelay.metered.ca:443?transport=tcp",
-            username: "openrelayproject",
-            credential: "openrelayproject"
-        },
-        {
-            urls: "turn:relay1.expressturn.com:3478",
-            username: "efVQYKCKIFJEFMZBNF",
-            credential: "iSXQMCMrWlADNQGe"
-        }
     ],
     iceCandidatePoolSize: 10
 };
 
+// Call this once on app init — replaces the static config with live TURN credentials.
+// METERED_API_KEY should be set as an environment variable (REACT_APP_METERED_API_KEY).
+const fetchIceServers = async () => {
+    const apiKey = process.env.REACT_APP_METERED_API_KEY;
+    if (!apiKey) {
+        console.log("[ICE] No Metered API key — using STUN only. Set REACT_APP_METERED_API_KEY for TURN.");
+        return;
+    }
+    try {
+        const res = await fetch(
+            `https://meetmatrix.metered.live/api/v1/turn/credentials?apiKey=${apiKey}`
+        );
+        const iceServers = await res.json();
+        peerConfigConnections = { iceServers, iceCandidatePoolSize: 10 };
+        console.log("[ICE] TURN credentials loaded:", iceServers.length, "servers");
+    } catch (e) {
+        console.log("[ICE] Failed to fetch TURN credentials, falling back to STUN:", e);
+    }
+};
+fetchIceServers();
+
 // VideoTile — dedicated component for each remote participant's video.
 // Using useEffect to set srcObject is more reliable than an inline ref callback,
 // especially on mobile Safari where the ref fires before the stream is fully active.
-function VideoTile({ socketId, stream }) {
+function VideoTile({ socketId, stream, username }) {
     const ref = useRef(null);
+    const [isMuted, setIsMuted] = useState(false);
 
     useEffect(() => {
         if (ref.current && stream) {
             ref.current.srcObject = stream;
+
+            // Detect if remote participant has no audio tracks (muted at source)
+            const audioTracks = stream.getAudioTracks();
+            if (audioTracks.length === 0 || !audioTracks[0].enabled) {
+                setIsMuted(true);
+            }
+            stream.onaddtrack = () => {
+                const tracks = stream.getAudioTracks();
+                setIsMuted(tracks.length === 0 || !tracks[0].enabled);
+            };
         }
     }, [stream]);
 
     return (
-        <div>
+        <div style={{ position: "relative", borderRadius: "10px", overflow: "hidden", background: "#111" }}>
             <video
                 ref={ref}
                 data-socket={socketId}
                 autoPlay
                 playsInline
-                style={{ width: '100%', borderRadius: '10px', background: '#111' }}
+                style={{ width: "100%", display: "block", borderRadius: "10px" }}
             />
+            {/* Name label + mute indicator overlay */}
+            <div style={{
+                position: "absolute", bottom: 0, left: 0, right: 0,
+                background: "rgba(0,0,0,0.55)", color: "white",
+                fontSize: "0.8rem", padding: "4px 10px",
+                display: "flex", justifyContent: "space-between", alignItems: "center"
+            }}>
+                <span>{username || "Guest"}</span>
+                {isMuted && <span title="Muted" style={{ color: "#f44" }}>🔇</span>}
+            </div>
         </div>
     );
 }
@@ -111,6 +132,9 @@ export default function VideoMeetComponent() {
     let [username, setUsername] = useState("");
     let [videos, setVideos] = useState([]);
     let [roomFull, setRoomFull] = useState(false);
+    let [participants, setParticipants] = useState({});
+    let [usernameError, setUsernameError] = useState(""); // socketId -> username map
+    
 
     // ─── Get camera/mic once on mount for the lobby preview ───────────────────
     useEffect(() => {
@@ -123,6 +147,23 @@ export default function VideoMeetComponent() {
                 if (localVideoRef.current) {
                     localVideoRef.current.srcObject = stream;
                 }
+
+                // Retroactively add tracks to any peer connections that were created
+                // before the stream was ready. This happens on mobile where the camera
+                // permission prompt delays stream availability past the point where
+                // user-joined fires and peer connections are created — causing mobile
+                // to send a trackless offer and the remote peer to never receive video.
+                Object.values(connections).forEach(pc => {
+                    const senders = pc.getSenders();
+                    stream.getTracks().forEach(track => {
+                        const alreadyAdded = senders.find(s => s.track && s.track.kind === track.kind);
+                        if (!alreadyAdded) {
+                            pc.addTrack(track, stream);
+                            console.log("[Media] Retroactively added", track.kind, "track to existing peer connection");
+                        }
+                    });
+                });
+
             } catch (e) {
                 // Camera failed — try audio only
                 try {
@@ -130,6 +171,15 @@ export default function VideoMeetComponent() {
                     window.localStream = stream;
                     setVideoAvailable(false);
                     setAudioAvailable(true);
+
+                    Object.values(connections).forEach(pc => {
+                        const senders = pc.getSenders();
+                        stream.getTracks().forEach(track => {
+                            const alreadyAdded = senders.find(s => s.track && s.track.kind === track.kind);
+                            if (!alreadyAdded) pc.addTrack(track, stream);
+                        });
+                    });
+
                 } catch (e2) {
                     setVideoAvailable(false);
                     setAudioAvailable(false);
@@ -278,14 +328,20 @@ export default function VideoMeetComponent() {
 
             socketRef.current.on("user-left", (id) => {
                 setVideos(prev => prev.filter(v => v.socketId !== id));
+                setParticipants(prev => { const next = {...prev}; delete next[id]; return next; });
                 delete connections[id];
                 delete iceCandidateQueue[id];
             });
 
             socketRef.current.on("user-joined", (id, clients) => {
+                // clients is now [{socketId, username}] — update participant map
+                const participantMap = {};
+                clients.forEach(c => { participantMap[c.socketId] = c.username; });
+                setParticipants(participantMap);
+
                 // Create peer connections for everyone currently in the room
-                clients.forEach(socketListId => {
-                    if (socketListId === socketIdRef.current) return; // skip self — was causing double video tile
+                clients.forEach(({ socketId: socketListId }) => {
+                    if (socketListId === socketIdRef.current) return; // skip self
                     if (connections[socketListId]) return; // already exists
                     connections[socketListId] = createPeerConnection(socketListId);
                     addLocalTracks(connections[socketListId]);
@@ -322,11 +378,17 @@ export default function VideoMeetComponent() {
             });
 
             // Emit last — all listeners are ready
-            socketRef.current.emit("join-call", window.location.href);
+            // Pass username so other participants can see who joined
+            socketRef.current.emit("join-call", window.location.href, username);
         });
     };
 
     const connect = () => {
+        if (!username.trim()) {
+            setUsernameError("Please enter your name to join");
+            return;
+        }
+        setUsernameError("");
         setAskForUsername(false);
         connectToSocketServer();
     };
@@ -424,18 +486,37 @@ export default function VideoMeetComponent() {
 
             {/* ── Lobby / Username Screen ── */}
             {!roomFull && askForUsername && (
-                <div>
-                    <h2>Enter into Lobby</h2>
-                    <TextField
-                        id="outlined-basic"
-                        label="Username"
-                        value={username}
-                        onChange={e => setUsername(e.target.value)}
-                        variant="outlined"
-                    />
-                    <Button variant="contained" onClick={connect}>Connect</Button>
-                    <div className={styles.meetVideoContainer}>
-                        <video ref={localVideoRef} autoPlay muted playsInline></video>
+                <div style={{display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",minHeight:"100vh",background:"rgb(1,4,48)",color:"white",gap:"16px",padding:"20px"}}>
+                    <h2 style={{marginBottom:"8px"}}>Ready to join?</h2>
+                    <p style={{color:"#aaa",marginBottom:"16px"}}>
+                        Room: <strong style={{color:"white"}}>{window.location.pathname.replace("/","")}</strong>
+                    </p>
+
+                    {/* Self preview */}
+                    <video ref={localVideoRef} autoPlay muted playsInline
+                        style={{width:"280px",borderRadius:"12px",background:"#111",marginBottom:"8px"}}
+                    ></video>
+
+                    <div style={{display:"flex",gap:"10px",alignItems:"flex-start"}}>
+                        <TextField
+                            id="outlined-basic"
+                            label="Your name"
+                            value={username}
+                            onChange={e => { setUsername(e.target.value); setUsernameError(""); }}
+                            onKeyDown={e => e.key === "Enter" && connect()}
+                            variant="outlined"
+                            error={!!usernameError}
+                            helperText={usernameError}
+                            autoFocus
+                            InputProps={{style:{background:"white",borderRadius:"8px"}}}
+                        />
+                        <Button
+                            variant="contained"
+                            onClick={connect}
+                            style={{height:"56px",borderRadius:"8px",padding:"0 24px"}}
+                        >
+                            Join Meeting
+                        </Button>
                     </div>
                 </div>
             )}
@@ -471,6 +552,26 @@ export default function VideoMeetComponent() {
                         </div>
                     )}
 
+                    {/* Top bar — meeting code + copy link + participant count */}
+                    <div style={{position:"absolute",top:0,left:0,right:0,display:"flex",alignItems:"center",justifyContent:"space-between",padding:"8px 16px",background:"rgba(0,0,0,0.4)",zIndex:10}}>
+                        <span style={{color:"#aaa",fontSize:"0.85rem"}}>
+                            👥 {videos.length + 1} participant{videos.length !== 0 ? "s" : ""}
+                            {" · "}{window.location.pathname.replace("/","")}
+                        </span>
+                        <IconButton
+                            size="small"
+                            style={{color:"white"}}
+                            onClick={() => {
+                                navigator.clipboard.writeText(window.location.href);
+                                alert("Meeting link copied!");
+                            }}
+                            title="Copy meeting link"
+                        >
+                            <ContentCopyIcon fontSize="small"/>
+                            <span style={{fontSize:"0.75rem",marginLeft:"4px"}}>Copy link</span>
+                        </IconButton>
+                    </div>
+
                     {/* Controls */}
                     <div className={styles.buttonContainers}>
                         <IconButton onClick={handleVideo} style={{ color: "white" }}>
@@ -494,13 +595,25 @@ export default function VideoMeetComponent() {
                         </Badge>
                     </div>
 
-                    {/* Self View */}
-                    <video className={styles.meetUserVideo} ref={localVideoRef} autoPlay muted playsInline></video>
+                    {/* Self View with name label */}
+                    <div style={{position:"absolute",bottom:"10vh",left:0,zIndex:10}}>
+                        <video className={styles.meetUserVideo} ref={localVideoRef} autoPlay muted playsInline
+                            style={{position:"relative",bottom:0,left:0}}></video>
+                        <div style={{background:"rgba(0,0,0,0.6)",color:"white",fontSize:"0.75rem",padding:"2px 8px",borderRadius:"0 0 8px 8px"}}>
+                            {username || "You"} (You)
+                            {!audio && <span style={{color:"#f44",marginLeft:"4px"}}>🔇</span>}
+                        </div>
+                    </div>
 
                     {/* Remote Participants */}
                     <div className={styles.conferenceView}>
                         {videos.map((v) => (
-                            <VideoTile key={v.socketId} socketId={v.socketId} stream={v.stream} />
+                            <VideoTile
+                                key={v.socketId}
+                                socketId={v.socketId}
+                                stream={v.stream}
+                                username={participants[v.socketId] || "Guest"}
+                            />
                         ))}
                     </div>
 

@@ -103,3 +103,70 @@ font-size: 1.7rem;
   height: auto;
   border-radius: 20px;
 }
+
+/* ─── Responsive breakpoints ───────────────────────────────────────────────── */
+
+/* Tablet and below */
+@media (max-width: 768px) {
+
+    /* Landing page — stack vertically, hide decorative image */
+    .landingMainContainer {
+        flex-direction: column;
+        justify-content: center;
+        padding-inline: 1.5rem;
+        text-align: center;
+        height: auto;
+        padding-block: 3rem;
+    }
+
+    .landingMainContainer > div:nth-child(1) {
+        font-size: 1.5rem;
+    }
+
+    .landingMainContainer > div:nth-child(2) {
+        display: none;
+    }
+
+    /* Home page — stack vertically */
+    .meetContainer {
+        flex-direction: column;
+        height: auto;
+        padding-block: 2rem;
+        gap: 2rem;
+        align-items: flex-start;
+    }
+
+    .rightPanel {
+        display: none;
+    }
+
+    .leftPanel {
+        height: auto;
+        width: 100%;
+    }
+
+    /* Navbar — reduce padding */
+    .navBar {
+        padding-inline: 12px;
+    }
+
+    .navBar h2 {
+        font-size: 1.2rem;
+    }
+}
+
+/* Mobile only */
+@media (max-width: 480px) {
+    .landingPageContainer nav h2 {
+        font-size: 1.3rem;
+    }
+
+    .landingPageContainer nav .navlist {
+        gap: 0.8rem;
+        font-size: 0.9rem;
+    }
+
+    .landingMainContainer > div:nth-child(1) {
+        font-size: 1.3rem;
+    }
+}
